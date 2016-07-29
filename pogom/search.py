@@ -5,9 +5,8 @@ import logging
 import math
 import time
 from sys import maxint
-import json
 import collections
-
+import cProfile
 from geographiclib.geodesic import Geodesic
 
 from pgoapi import PGoApi
@@ -17,7 +16,6 @@ from .models import parse_map, SearchConfig
 log = logging.getLogger(__name__)
 
 TIMESTAMP = '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
-REQ_SLEEP = 1
 api = PGoApi()
 queue = collections.deque()
 consecutive_map_fails = 0
@@ -40,11 +38,10 @@ def set_cover():
         for j in range(0, 6 * i):
             p = points[i - 1][(j - j / i - 1 + (j % i == 0))]
             p_new = Geodesic.WGS84.Direct(p['lat2'], p['lon2'], (j+i-1)/i * 60, d)
-            s = Geodesic.WGS84.Inverse(p_new['lat2'], p_new['lon2'], lat, lng)['s12']
-            p_new['s'] = s
+            p_new['s'] = Geodesic.WGS84.Inverse(p_new['lat2'], p_new['lon2'], lat, lng)['s12']
             points[i].append(p_new)
 
-            if s > SearchConfig.RADIUS:
+            if p_new['s'] > SearchConfig.RADIUS:
                 oor_counter += 1
 
         if oor_counter == 6 * i:
@@ -103,6 +100,7 @@ def login(args, position):
 
 
 def login_if_necessary(args, position):
+    global api
     if api._rpc.auth_provider and api._rpc.auth_provider._ticket_expire:
         remaining_time = api._rpc.auth_provider._ticket_expire / 1000 - time.time()
 
@@ -113,7 +111,7 @@ def login_if_necessary(args, position):
         login(args, position)
 
 
-def search(args):
+def search(args, req_sleep=1):
     num_steps = len(SearchConfig.COVER)
 
     i = 1
@@ -125,7 +123,7 @@ def search(args):
         while not response_dict:
             log.info('Map Download failed. Trying again.')
             response_dict = send_map_request(api, step_location, args)
-            time.sleep(REQ_SLEEP)
+            time.sleep(req_sleep)
 
         try:
             parse_map(response_dict)
@@ -147,7 +145,6 @@ def search(args):
 def search_async(args):
     num_steps = len(SearchConfig.COVER)
 
-    login_if_necessary(args, (SearchConfig.ORIGINAL_LATITUDE, SearchConfig.ORIGINAL_LONGITUDE, 0))
     log.info("Starting scan of {} locations".format(num_steps))
 
     i = 1
@@ -173,7 +170,7 @@ def search_async(args):
             queue.clear()
             queue.extend(SearchConfig.COVER)
 
-        if (i%20 == 0):
+        if (i % 20 == 0):
             log.info(api._rpc._curl.stats())
 
         i += 1
@@ -211,7 +208,7 @@ def callback(response_dict):
         log.exception('Failed to parse response: {}'.format(response_dict))
         consecutive_map_fails += 1
     except:  # make sure we dont crash in the main loop
-        log.exception('Unexpected error when parsing response: {}'.format(response_dict))
+        log.exception('Unexpected error while parsing response: {}'.format(response_dict))
         consecutive_map_fails += 1
 
 
@@ -222,7 +219,10 @@ def throttle():
     sleep_time = max(min_time_per_scan - (time.time() - scan_start_time), 0)
     log.info("Scan finished. Sleeping {:.2f} seconds before continuing.".format(sleep_time))
     SearchConfig.LAST_SUCCESSFUL_REQUEST = -1
-    time.sleep(sleep_time)
+    while sleep_time > 0 and not SearchConfig.CHANGE:
+        time.sleep(1)
+        sleep_time -= 1
+
 
 
 def search_loop_async(args):
